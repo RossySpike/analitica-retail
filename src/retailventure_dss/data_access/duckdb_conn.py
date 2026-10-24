@@ -21,7 +21,7 @@ def _create_dim():
             sk_cliente INTEGER PRIMARY KEY,
             cliente_id VARCHAR NOT NULL UNIQUE,
             edad INTEGER CHECK (edad >= 0),
-            genero VARCHAR CHECK (genero IN ('M', 'F')),
+            genero VARCHAR CHECK (genero IN ('M', 'F', 'ND')),
             ciudad VARCHAR,
             segmento VARCHAR,
             fecha_registro DATE,
@@ -207,7 +207,7 @@ def _create_clean():
         CREATE TABLE IF NOT EXISTS clean_clientes (
             cliente_id VARCHAR PRIMARY KEY,
             edad INTEGER,
-            genero VARCHAR CHECK (genero IN ('M', 'F')),
+            genero VARCHAR CHECK (genero IN ('M', 'F', 'ND')),
             ciudad VARCHAR,
             segmento VARCHAR,
             fecha_registro DATE,

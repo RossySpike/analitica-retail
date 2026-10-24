@@ -1,4 +1,5 @@
 from datetime import date
+import os
 from typing import Any, Final, cast
 from os import getenv
 import numpy as np
@@ -22,9 +23,16 @@ from retailventure_dss.etl.models.transacciones import Transacciones
 import pandas as pd
 
 from retailventure_dss.etl.models.type import RetailVentureTables
+from retailventure_dss.etl.quality import (
+    cargar_crudos,
+    evaluar_reglas,
+    oportunidad,
+    perfil_crudo,
+)
 
 
 _CSV_DIR: Final[str] = getenv("CSV_DIR", "./data/in")
+_OUT_DIR: Final[str] = getenv("OUT_DIR", "./data/out")
 
 
 MAPPED_CLASS_TO_FILES: Final = [
@@ -37,36 +45,14 @@ MAPPED_CLASS_TO_FILES: Final = [
 ]
 
 
-def num_outliers(df: pd.DataFrame) -> int:
-    outliers_detected = 0
-
-    cols_num = df.select_dtypes(include=["number"]).columns.tolist()
-    cols_num = [c for c in cols_num if df[c].dtype != bool]
-
-    for col in cols_num:
-        Q1 = df[col].quantile(0.25)
-        Q3 = df[col].quantile(0.75)
-        IQR = Q3 - Q1
-
-        if IQR == 0:
-            continue
-
-        lower = Q1 - 1.5 * IQR
-        upper = Q3 + 1.5 * IQR
-
-        outliers_detected += int(((df[col] < lower) | (df[col] > upper)).sum())
-
-    return outliers_detected
-
-
-outliers = {}
+perfiles: dict[str, dict] = {}
 
 
 def extract(filepath: str) -> list[dict[Any, Any]]:
     raw_data: pd.DataFrame = pd.read_csv(filepath_or_buffer=filepath)
     for entry in MAPPED_CLASS_TO_FILES:
         if filepath == entry[0]:
-            outliers[str(entry[1])] = num_outliers(raw_data)
+            perfiles[str(entry[1])] = perfil_crudo(raw_data)
 
     return raw_data.to_dict(orient="records")
 
@@ -74,20 +60,20 @@ def extract(filepath: str) -> list[dict[Any, Any]]:
 class TransformResult:
     approved_entries: list[type[BaseModel]]
     rejected_entries: list[dict]
-    nulls: int
+    invalid: int
     dups: int
 
     def __init__(
         self,
         approved_entries: list[type[BaseModel]],
         rejected_entries: list[dict],
-        nulls,
+        invalid,
         dups,
     ) -> None:
 
         self.approved_entries = approved_entries
         self.rejected_entries = rejected_entries
-        self.nulls = nulls
+        self.invalid = invalid
         self.dups = dups
 
 
@@ -98,7 +84,7 @@ def transform(
     rejected_rows: list[dict] = []
     seen_ids = set()
     dups = 0
-    nulls = 0
+    invalid = 0
     for record in records:
         try:
             clean_object = object_class(**record)
@@ -108,7 +94,7 @@ def transform(
             seen_ids.add(clean_object.get_id())
             approved_rows.append(clean_object)
         except ValidationError as e:
-            nulls += 1
+            invalid += 1
             record["motivo_error"] = e.errors()[0]["msg"]
             rejected_rows.append(record)
         except ValueError:
@@ -116,7 +102,7 @@ def transform(
             record["motivo_error"] = "Valor duplicado"
             rejected_rows.append(record)
 
-    return TransformResult(approved_rows, rejected_rows, nulls, dups)
+    return TransformResult(approved_rows, rejected_rows, invalid, dups)
 
 
 def extract_and_transform(filepath, object_class):
@@ -180,7 +166,6 @@ def etl():
         )
         for c in data
     ]
-    print(bulk)
     print(f"Inserting in dirty {data[0].__class__}")
     conn.executemany(
         """
@@ -354,7 +339,7 @@ def etl():
                 (cliente_id, edad, genero, ciudad, segmento, fecha_registro, canal_adquisicion)
             SELECT cliente_id, edad, genero, ciudad, segmento, fecha_registro, canal_adquisicion
             FROM stg_clientes
-            WHERE genero IN ('M', 'F')
+            WHERE genero IN ('M', 'F', 'ND')
             AND edad >= 0
             AND fecha_registro IS NOT NULL
         """
@@ -418,7 +403,7 @@ def etl():
             WHERE s.cantidad > 0
             AND s.precio_unitario >= 0.00
             AND s.descuento >= 0.000
-            AND s.descuento <= 0.000
+            AND s.descuento <= 1.000
             AND s.monto_neto >= 0.00
         """
     )
@@ -457,52 +442,79 @@ def etl():
         (Devolucion, "devoluciones", "clean_devoluciones"),
     ]
 
+    os.makedirs(_OUT_DIR, exist_ok=True)
+
+    # Las métricas salen de los CSV crudos, no de lo que sobrevivió al ETL.
+    crudos = cargar_crudos(_CSV_DIR)
+    df_reglas, consistencia = evaluar_reglas(crudos)
+    oport = oportunidad(crudos)
+
     audits = []
     todos_los_errores = []
+    filas_outliers = []
 
     for modelo, nombre_ds, tabla_clean in modelos_a_auditar:
         data = cast(TransformResult, results.get(str(modelo)))
+        perfil = perfiles[str(modelo)]
         total = len(data.approved_entries) + len(data.rejected_entries)
 
         if total == 0:
             continue
 
-        num_columns = len(modelo.model_fields)
         aprobados_pydantic = len(data.approved_entries)
         aprobados_bd = conn.execute(f"SELECT COUNT(*) FROM {tabla_clean}").fetchone()[0]
-        descartados_fk = aprobados_pydantic - aprobados_bd
+        descartados_sql = aprobados_pydantic - aprobados_bd
 
-        if descartados_fk > 0:
+        if descartados_sql > 0:
             todos_los_errores.append(
                 {
                     "dataset": nombre_ds,
-                    "motivo": f"Inconsistencia referencial (FK): {descartados_fk} filas huérfanas",
+                    "motivo": f"Filas descartadas por el filtro SQL de limpieza: {descartados_sql}",
                     "datos_crudos": "N/A",
                 }
             )
 
-        completitud = ((total * num_columns - data.nulls) / (total * num_columns)) * 100
-        unicidad = ((total - data.dups) / total) * 100
-        consistencia = (aprobados_bd / total) * 100
-        oportunidad = (aprobados_pydantic / total) * 100
+        for columna, (n, inferior, superior) in perfil["outliers"].items():
+            filas_outliers.append(
+                {
+                    "dataset": nombre_ds,
+                    "columna": columna,
+                    "outliers": n,
+                    "pct": round(100 * n / total, 2),
+                    "limite_inferior": round(inferior, 2),
+                    "limite_superior": round(superior, 2),
+                }
+            )
 
-        audit = {
-            "dataset": nombre_ds,
-            "total_filas": total,
-            "valores_null": data.nulls,
-            "duplicados": data.dups,
-            "outliers_detectados": outliers.get(str(modelo), 0),
-            "completitud_%": round(completitud, 2),
-            "consistencia_%": round(consistencia, 2),
-            "unicidad_%": round(unicidad, 2),
-            "oportunidad_%": round(oportunidad, 2),
-        }
-        audits.append(audit)
+        completitud = 100 * (1 - perfil["celdas_nulas"] / perfil["celdas"])
+        unicidad = 100 * (total - data.dups) / total
+
+        audits.append(
+            {
+                "dataset": nombre_ds,
+                "total_filas": total,
+                "celdas_nulas": perfil["celdas_nulas"],
+                "registros_invalidos": data.invalid,
+                "ids_duplicados": data.dups,
+                "filas_duplicadas": perfil["filas_duplicadas"],
+                "outliers_detectados": sum(n for n, _, _ in perfil["outliers"].values()),
+                "completitud_%": round(completitud, 2),
+                "unicidad_%": round(unicidad, 2),
+                "consistencia_%": consistencia[nombre_ds][0],
+                "consistencia_critica_%": consistencia[nombre_ds][1],
+                "oportunidad_%": oport[nombre_ds],
+                "retencion_limpieza_%": round(100 * aprobados_bd / total, 2),
+            }
+        )
 
     df_auditoria = pd.DataFrame(audits)
-    df_auditoria.to_csv(f"{_CSV_DIR}/reporte_calidad.csv", index=False)
-    print("\nReporte de Calidad generado: reporte_calidad.csv")
+    df_auditoria.to_csv(f"{_OUT_DIR}/reporte_calidad.csv", index=False)
+    df_reglas.to_csv(f"{_OUT_DIR}/reporte_reglas_negocio.csv", index=False)
+    pd.DataFrame(filas_outliers).to_csv(f"{_OUT_DIR}/reporte_outliers.csv", index=False)
+    print("\nReportes de calidad generados en", _OUT_DIR)
     print(df_auditoria.to_string(index=False))
+    print()
+    print(df_reglas.drop(columns=["accion_sugerida"]).to_string(index=False))
 
     for modelo, nombre_ds, _ in modelos_a_auditar:
         data = cast(TransformResult, results.get(str(modelo)))
@@ -516,9 +528,10 @@ def etl():
             )
 
     if todos_los_errores:
-        df_errores = pd.DataFrame(todos_los_errores)
-        df_errores.to_csv(f"{_CSV_DIR}/errores_inconsistentes.csv", index=False)
-        print("\nRegistro de errores generado: errores_inconsistentes.csv")
+        pd.DataFrame(todos_los_errores).to_csv(
+            f"{_OUT_DIR}/errores_inconsistentes.csv", index=False
+        )
+        print("Registro de errores generado: errores_inconsistentes.csv")
 
     print("Cargando capa dimensional...")
     populate_dimensional_tables()
@@ -676,4 +689,5 @@ def populate_dimensional_tables():
     """)
 
 
-etl()
+if __name__ == "__main__":
+    etl()
